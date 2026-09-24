@@ -1,0 +1,39 @@
+# 统一换行符策略，避免依赖各台机器的 core.autocrlf 设置。
+#
+# 默认：由 Git 自行判断文本/二进制，文本在仓库内统一以 LF 存储。
+# 这样换行策略随仓库走，不同机器签出结果一致，不会产生整文件差异。
+* text=auto
+
+# 明确指定源码与配置为文本，仓库内统一 LF
+*.cs        text eol=lf
+*.xaml      text eol=lf
+*.csproj    text eol=lf
+*.sln       text eol=crlf
+*.json      text eol=lf
+*.md        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+
+# 点文件本身也纳入规则，否则它们会沿用 core.autocrlf 而产生警告
+.gitignore     text eol=lf
+.gitattributes text eol=lf
+.editorconfig  text eol=lf
+
+# Windows 批处理必须是 CRLF，否则 cmd.exe 解析异常
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+
+# PowerShell 脚本用 CRLF（Windows 生态惯例）
+*.ps1       text eol=crlf
+
+# 二进制文件：禁止任何换行符转换，否则会损坏内容
+*.jpeg      binary
+*.jpg       binary
+*.png       binary
+*.gif       binary
+*.ico       binary
+*.pdf       binary
+*.zip       binary
+*.dll       binary
+*.exe       binary
+*.pdb       binary

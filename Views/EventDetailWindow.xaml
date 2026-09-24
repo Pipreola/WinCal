@@ -1,0 +1,96 @@
+<Window x:Class="WinCal.Views.EventDetailWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="EventDetail"
+        Width="240" SizeToContent="Height"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        ShowInTaskbar="False"
+        Topmost="True"
+        ResizeMode="NoResize"
+        MaxHeight="400">
+
+    <Window.Resources>
+        <!-- 行首图标统一样式。
+             原先用 emoji（🕐📍📅）：Segoe UI Emoji 按彩色字形渲染，
+             设 Foreground 无效，而这几个 emoji 本身配色偏深，
+             在深色主题下几乎看不见。改用矢量 Path 后颜色可跟随主题。 -->
+        <Style x:Key="RowIconStyle" TargetType="Path">
+            <Setter Property="Fill" Value="{DynamicResource TextSecondaryBrush}" />
+            <Setter Property="Stretch" Value="Uniform" />
+            <Setter Property="Width" Value="12" />
+            <Setter Property="Height" Value="12" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="Margin" Value="0,0,6,0" />
+        </Style>
+    </Window.Resources>
+
+    <Border Background="{DynamicResource BackgroundBrush}"
+            BorderBrush="{DynamicResource BorderBrush}"
+            BorderThickness="1"
+            CornerRadius="8"
+            Padding="14">
+
+        <StackPanel>
+            <!-- 事件标题 -->
+            <TextBlock x:Name="DetailTitle"
+                       FontSize="14" FontWeight="SemiBold"
+                       Foreground="{DynamicResource TextPrimaryBrush}"
+                       TextWrapping="Wrap"
+                       Margin="0,0,0,10" />
+
+            <!-- 时间 -->
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                <Path Style="{StaticResource RowIconStyle}"
+                      Data="M12,20A8,8 0 0,0 20,12A8,8 0 0,0 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20M12,2A10,10 0 0,1 22,12A10,10 0 0,1 12,22C6.47,22 2,17.5 2,12A10,10 0 0,1 12,2M12.5,7V12.25L17,14.92L16.25,16.15L11,13V7H12.5Z" />
+                <TextBlock x:Name="DetailTime"
+                           FontSize="12"
+                           Foreground="{DynamicResource TextSecondaryBrush}"
+                           VerticalAlignment="Center"
+                           TextWrapping="Wrap" />
+            </StackPanel>
+
+            <!-- 地点 -->
+            <StackPanel x:Name="LocationPanel"
+                        Orientation="Horizontal" Margin="0,0,0,6"
+                        Visibility="Collapsed">
+                <Path Style="{StaticResource RowIconStyle}"
+                      Data="M12,11.5A2.5,2.5 0 0,1 9.5,9A2.5,2.5 0 0,1 12,6.5A2.5,2.5 0 0,1 14.5,9A2.5,2.5 0 0,1 12,11.5M12,2A7,7 0 0,0 5,9C5,14.25 12,22 12,22C12,22 19,14.25 19,9A7,7 0 0,0 12,2Z" />
+                <TextBlock x:Name="DetailLocation"
+                           FontSize="12"
+                           Foreground="{DynamicResource TextSecondaryBrush}"
+                           VerticalAlignment="Center"
+                           TextWrapping="Wrap" />
+            </StackPanel>
+
+            <!-- 日历来源 -->
+            <StackPanel x:Name="CalendarPanel"
+                        Orientation="Horizontal" Margin="0,0,0,6"
+                        Visibility="Collapsed">
+                <Path Style="{StaticResource RowIconStyle}"
+                      Data="M19,19H5V8H19M16,1V3H8V1H6V3H5C3.89,3 3,3.89 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V5C21,3.89 20.1,3 19,3H18V1M17,12H12V17H17V12Z" />
+                <TextBlock x:Name="DetailCalendar"
+                           FontSize="12"
+                           Foreground="{DynamicResource TextSecondaryBrush}"
+                           VerticalAlignment="Center"
+                           TextWrapping="Wrap" />
+            </StackPanel>
+
+            <!-- 分隔线 -->
+            <Border x:Name="DescSeparator"
+                    Height="1"
+                    Background="{DynamicResource SeparatorBrush}"
+                    Margin="0,4,0,6"
+                    Visibility="Collapsed" />
+
+            <!-- 描述 -->
+            <TextBlock x:Name="DetailDescription"
+                       FontSize="12"
+                       Foreground="{DynamicResource TextSecondaryBrush}"
+                       TextWrapping="Wrap"
+                       MaxHeight="120"
+                       Visibility="Collapsed" />
+        </StackPanel>
+    </Border>
+</Window>
