@@ -3,7 +3,7 @@ using WinCal.Core.Models;
 namespace WinCal.Core.Services;
 
 /// <summary>
-/// 空日历服务（ICS URL 未配置时的占位服务）
+/// 空日历服务（ICS URL 未配置或系统日历服务不可用时的占位服务）
 /// </summary>
 public class EmptyCalendarService : ICalendarService
 {

@@ -132,7 +132,7 @@ public class CalendarViewModel : INotifyPropertyChanged
 
     private static ICalendarService CreateSystemService()
     {
-        // 检查 WindowsCalendarService 是否可用（编译时可能被排除）
+        // WindowsCalendarService 编译时可能被排除；不可用时不生成虚构事件。
         try
         {
             var type = Type.GetType("WinCal.Core.Services.WindowsCalendarService, WinCal");
@@ -146,7 +146,7 @@ public class CalendarViewModel : INotifyPropertyChanged
             // WinRT not available
         }
 
-        return new MockCalendarService();
+        return new EmptyCalendarService();
     }
 
     private static readonly string[] SubscriptionColors = {

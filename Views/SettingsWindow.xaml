@@ -126,9 +126,24 @@
                     <ComboBoxItem Content="ICS 订阅链接" />
                     <ComboBoxItem Content="两者都用" />
                 </ComboBox>
+                <TextBlock Text="当前版本尚未接入系统日历事件；请使用 ICS 订阅。"
+                           FontSize="11" TextWrapping="Wrap"
+                           Foreground="{DynamicResource TextSecondaryBrush}"
+                           Margin="0,0,0,12" />
 
                 <!-- ICS URL 订阅列表 -->
                 <StackPanel x:Name="IcsPanel" Visibility="Collapsed" Margin="0,0,0,20">
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="测试年份" FontSize="11"
+                                   Foreground="{DynamicResource TextSecondaryBrush}"
+                                   VerticalAlignment="Center" Margin="0,0,8,0" />
+                        <TextBox x:Name="IcsTestYearTextBox" Width="64" Padding="4,3"
+                                 MaxLength="4" />
+                        <TextBlock Text="仅用于含 {year} 的链接" FontSize="11"
+                                   Foreground="{DynamicResource TextSecondaryBrush}"
+                                   VerticalAlignment="Center" Margin="8,0,0,0" />
+                    </StackPanel>
+
                     <!-- 已添加的 URL 列表 -->
                     <ItemsControl x:Name="IcsUrlList" Margin="0,0,0,8">
                         <ItemsControl.ItemTemplate>
@@ -144,6 +159,7 @@
                                                 <ColumnDefinition Width="Auto" />
                                                 <ColumnDefinition Width="*" />
                                                 <ColumnDefinition Width="Auto" />
+                                                <ColumnDefinition Width="Auto" />
                                             </Grid.ColumnDefinitions>
                                             <Ellipse Grid.Column="0" Width="8" Height="8"
                                                      Fill="{Binding Color}"
@@ -155,7 +171,13 @@
                                                        Foreground="{DynamicResource TextSecondaryBrush}"
                                                        TextTrimming="CharacterEllipsis"
                                                        VerticalAlignment="Center" />
-                                            <Button Grid.Column="2" Content="✕"
+                                            <Button Grid.Column="2" Content="测试"
+                                                    FontSize="11" Padding="6,3"
+                                                    Margin="4,0,0,0"
+                                                    Cursor="Hand"
+                                                    Click="OnTestIcsUrl"
+                                                    Tag="{Binding FullUrl}" />
+                                            <Button Grid.Column="3" Content="✕"
                                                     FontSize="11" Width="24" Height="24"
                                                     Padding="0" Margin="4,0,0,0"
                                                     Background="Transparent" BorderThickness="0"
@@ -178,11 +200,16 @@
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*" />
                             <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
                         <TextBox Grid.Column="0" x:Name="NewIcsUrlTextBox"
                                  Padding="8,6"
                                  ToolTip="输入 .ics 日历订阅链接；按年份分文件的订阅可用 {year} 占位，如 .../years/{year}.ics" />
-                        <Button Grid.Column="1" Content="添加"
+                        <Button Grid.Column="1" Content="测试"
+                                Padding="10,6" Margin="6,0,0,0"
+                                Cursor="Hand"
+                                Click="OnTestIcsUrl" />
+                        <Button Grid.Column="2" Content="添加"
                                 Padding="12,6" Margin="6,0,0,0"
                                 Background="{DynamicResource TodayAccentBrush}"
                                 Foreground="White"

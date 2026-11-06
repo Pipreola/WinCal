@@ -1,6 +1,6 @@
 # WinCal 开发进度
 
-> 最后更新：2026-09-24
+> 最后更新：2026-11-06
 
 ## 总体进度：MVP + 设置界面已完成，ICS 订阅支持按年份分文件 ✅
 
@@ -65,6 +65,7 @@
 - [x] 周起始日（周日 / 周一）
 - [x] 近期事件显示天数（1/3/7 天）
 - [x] .ics 刷新频率（10/30/60/120 分钟）
+- [x] .ics 链接测试（支持指定 `{year}` 年份，检测 HTTP、ICS 格式和年份事件）
 - [x] 设置持久化（JSON 文件 `%LOCALAPPDATA%/miniCal/settings.json`）
 - [ ] 农历显示开关（README 曾列出，实际未实现，农历始终显示）
 - [ ] 主界面顶部时间日期显示开关（`ShowHeaderDateTime` 已定义但无界面、无读取方）
@@ -72,13 +73,13 @@
 
 ### 数据服务
 - [x] 日历服务接口（ICalendarService）
-- [x] 模拟数据服务（MockCalendarService，用于调试）
+- [x] 移除模拟事件；系统日历服务不可用时返回空事件列表
 - [x] .ics 远程日历服务（IcsCalendarService，使用 Ical.Net 解析）
 - [x] 按年份分文件的 .ics 服务（YearlyIcsCalendarService，`{year}` 占位 + 多级兜底）
 - [x] 聚合日历服务（AggregateCalendarService，多数据源合并）
-- [x] 空日历服务（EmptyCalendarService，无数据源时的默认服务）
+- [x] 空日历服务（EmptyCalendarService，无数据源或系统日历服务不可用时使用）
 - [ ] Windows 日历 API 接入（WindowsCalendarService 已写好但需 Windows SDK，
-      在 csproj 中被 `<Compile Remove>` 排除；「系统日历」数据源实际回落到 MockCalendarService）
+      在 csproj 中被 `<Compile Remove>` 排除；「系统日历」数据源目前返回空事件列表）
 
 ### 工具类
 - [x] 窗口定位（WindowPositionHelper）
@@ -108,7 +109,6 @@
 | `Core/Models/CalendarAccountInfo.cs` | 日历账户信息模型 |
 | `Core/Services/ICalendarService.cs` | 日历服务接口 |
 | `Core/Services/WindowsCalendarService.cs` | Windows 日历 API（需 WinRT 暂未启用） |
-| `Core/Services/MockCalendarService.cs` | 模拟数据服务 |
 | `Core/Services/IcsCalendarService.cs` | .ics 远程日历服务 |
 | `Core/Services/YearlyIcsCalendarService.cs` | 按年份分文件的 .ics 服务（⭐ 新增） |
 | `Core/Services/AggregateCalendarService.cs` | 多数据源聚合服务 |
@@ -237,7 +237,7 @@ if (isAllDay && endTime.Date <= startTime.Date)
 date.Date < (e.EndTime.Date > e.StartTime.Date ? e.EndTime.Date : e.StartTime.Date.AddDays(1))
 ```
 
-③ 即使 IcsCalendarService 已修正 EndTime，ViewModel 层仍做兜底，确保其他数据源（如 MockCalendarService）也不会出现此问题。
+③ 即使 IcsCalendarService 已修正 EndTime，ViewModel 层仍做兜底，确保其他数据源也不会出现此问题。
 
 #### 2026-05-07 日历格子多圆点支持（最多3个）
 
@@ -277,6 +277,13 @@ date.Date < (e.EndTime.Date > e.StartTime.Date ? e.EndTime.Date : e.StartTime.Da
 ---
 
 ## 开发日志
+
+### 2026-11-06
+
+移除模拟事件服务。系统日历 API 未启用时使用空日历服务；「两者都用」仍可显示 ICS 订阅事件。
+
+设置页加入 ICS 链接测试，支持测试新输入和已添加的订阅，按指定年份展开 `{year}` 并检查返回数据。
+实测 chinese-days 的 2026/2027 年份链接均有效，分别包含 13/12 条事件定义；下方 2026-09-24 的 2027 年 404 记录为当时状态。
 
 ### 2026-09-24
 

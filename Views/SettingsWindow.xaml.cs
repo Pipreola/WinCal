@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -37,6 +38,7 @@ public partial class SettingsWindow : Window
         _settings = AppSettings.Load();
 
         InitializeComponent();
+        IcsTestYearTextBox.Text = DateTime.Today.Year.ToString(CultureInfo.InvariantCulture);
         LoadSettings();
         _initialized = true;
     }
@@ -160,6 +162,56 @@ public partial class SettingsWindow : Window
 
         NewIcsUrlTextBox.Text = "";
         RefreshIcsUrlList();
+    }
+
+    /// <summary>
+    /// 测试新输入的或已添加的 ICS 链接。含 {year} 的链接按输入年份展开。
+    /// </summary>
+    private async void OnTestIcsUrl(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button button) return;
+
+        var url = (button.Tag as string ?? NewIcsUrlTextBox.Text).Trim();
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            MessageBox.Show(this, "请先输入 ICS 订阅链接。", "测试链接",
+                MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var year = DateTime.Today.Year;
+        if (url.Contains(YearlyIcsCalendarService.YearPlaceholder, StringComparison.OrdinalIgnoreCase) &&
+            (!int.TryParse(IcsTestYearTextBox.Text, NumberStyles.None, CultureInfo.InvariantCulture, out year) ||
+             year < 1 || year >= 9999))
+        {
+            MessageBox.Show(this, "测试年份请输入 1 到 9998 之间的整数。", "测试链接",
+                MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var oldContent = button.Content;
+        button.IsEnabled = false;
+        button.Content = "测试中…";
+        try
+        {
+            var result = await IcsLinkTester.TestAsync(url, year);
+            if (!IsVisible) return;
+
+            var caption = result.IsValid
+                ? result.HasEvents ? "链接有效" : "链接有效，但无事件"
+                : "链接测试失败";
+            var icon = result.IsValid
+                ? result.HasEvents ? MessageBoxImage.Information : MessageBoxImage.Warning
+                : MessageBoxImage.Warning;
+
+            MessageBox.Show(this, $"{result.Message}\n\n实际请求：{result.ResolvedUrl}", caption,
+                MessageBoxButton.OK, icon);
+        }
+        finally
+        {
+            button.Content = oldContent;
+            button.IsEnabled = true;
+        }
     }
 
     /// <summary>
