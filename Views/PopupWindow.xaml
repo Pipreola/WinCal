@@ -57,7 +57,7 @@
         <Grid>
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />  <!-- 日历 -->
-                <RowDefinition Height="Auto" />  <!-- 分隔线 + 事件区域 -->
+                <RowDefinition x:Name="CalendarEventsRow" Height="Auto" />  <!-- 分隔线 + 事件区域 -->
             </Grid.RowDefinitions>
 
             <!-- 月历控件 -->
@@ -70,7 +70,7 @@
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />  <!-- 分隔线 -->
                     <RowDefinition Height="Auto" />  <!-- 标题栏（近期事件 + 齿轮） -->
-                    <RowDefinition Height="160" />    <!-- 事件列表（固定高度，恰好4条） -->
+                    <RowDefinition x:Name="EventListHeightRow" Height="160" />
                 </Grid.RowDefinitions>
 
                 <!-- 分隔线 -->

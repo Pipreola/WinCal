@@ -11,11 +11,27 @@ public partial class App : Application
 {
     private TaskbarIcon? _trayIcon;
     private PopupWindow? _popup;
+    private PopupWindow? _systemPopup;
     private SettingsWindow? _settingsWindow;
     private SystemCalendarInterceptor? _interceptor;
+    private bool _hasShownSystemPanel;
+    private bool _regionLookupPending;
+    private IntPtr _regionLookupHost;
+    private int _regionLookupVersion;
+    private Mutex? _instanceMutex;
 
     protected override void OnStartup(StartupEventArgs e)
     {
+        // 两个主进程不能同时保存、裁剪和恢复同一个 Shell 窗口。
+        _instanceMutex = new Mutex(true, @"Local\WinCal.Main", out bool firstInstance);
+        if (!firstInstance)
+        {
+            _instanceMutex.Dispose();
+            _instanceMutex = null;
+            Shutdown();
+            return;
+        }
+
         base.OnStartup(e);
 
         // 全局异常处理
@@ -56,7 +72,10 @@ public partial class App : Application
 
         _trayIcon.ContextMenu = menu;
 
-        // 启动系统日历拦截器：点击任务栏时钟时替换为我们的面板
+        // 将恢复守护的进程启动移出任务栏点击路径；此时尚不读取或修改系统面板。
+        NativeCalendarRegionLease.WarmGuardian();
+
+        // 保留原生通知，精确定位并覆盖同一面板中的日历区域。
         bool interceptorOk = false;
         try
         {
@@ -73,6 +92,32 @@ public partial class App : Application
         // 安全兜底：隐藏图标后唯一入口是「点击任务栏时钟」，依赖拦截器；
         // 若拦截器未成功挂钩，强制显示图标，否则用户将无法唤出面板也无法进入设置。
         ApplyTrayIconVisibility(settings.ShowTrayIcon, interceptorOk);
+        QueueSystemPopupWarmup();
+    }
+
+    private PopupWindow GetSystemPopup()
+    {
+        if (_systemPopup is not null) return _systemPopup;
+        var popup = new PopupWindow(prepareSystemOverlay: true);
+        popup.CalendarOverlayUnavailable += (_, _) =>
+        {
+            SystemCalendarPlacementCache.Shared.Invalidate(popup.SystemPanelWindow);
+            _hasShownSystemPanel = false;
+            ApplyTrayIconVisibility(AppSettings.Load().ShowTrayIcon,
+                _interceptor?.IsHookInstalled ?? false);
+        };
+        _systemPopup = popup;
+        return popup;
+    }
+
+    private void QueueSystemPopupWarmup()
+    {
+        Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.ContextIdle, new Action(() =>
+        {
+            if (Dispatcher.HasShutdownStarted || _regionLookupPending) return;
+            try { GetSystemPopup().WarmSystemOverlay(); }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"WinCal overlay warmup: {ex.Message}"); }
+        }));
     }
 
     /// <summary>
@@ -98,7 +143,10 @@ public partial class App : Application
             return;
         }
 
-        _trayIcon.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
+        // 安装钩子并不代表当前 Windows 的窗口一定能被识别。
+        // 首次成功联动前保留托盘，避免隐藏图标后没有任何可用入口。
+        bool canHide = interceptorAvailable && _hasShownSystemPanel;
+        _trayIcon.Visibility = show || !canHide ? Visibility.Visible : Visibility.Collapsed;
     }
 
     /// <summary>
@@ -111,6 +159,15 @@ public partial class App : Application
         var settings = AppSettings.Load();
         bool interceptorOk = app._interceptor?.IsHookInstalled ?? false;
         app.ApplyTrayIconVisibility(settings.ShowTrayIcon, interceptorOk);
+        // Settings may change the data source; recreate the hidden overlay with fresh services.
+        app._regionLookupVersion++;
+        app._regionLookupPending = false;
+        SystemCalendarPlacementCache.Shared.Invalidate();
+        var previous = app._systemPopup;
+        app._systemPopup = null;
+        previous?.Close();
+        if (app._popup == previous) app._popup = null;
+        app.QueueSystemPopupWarmup();
     }
 
     /// <summary>
@@ -156,35 +213,129 @@ public partial class App : Application
     }
 
     /// <summary>
-    /// 显示日历面板（不切换，始终显示）。用于拦截器回调。
+    /// 保留原生通知，用不激活的 miniCal 覆盖原生日历卡片。
     /// </summary>
-    private void ShowPopup()
+    private async void ShowPopup(IntPtr systemPanelWindow)
     {
+        int requestVersion = 0;
+        PopupWindow? candidate = null;
         try
         {
-            if (_popup != null && _popup.IsVisible)
+            if (!SystemCalendarInterceptor.IsSystemPanelVisible(systemPanelWindow))
+                return;
+
+            if (_popup != null && _popup.IsVisible && _popup.SystemPanelWindow == systemPanelWindow)
+                return;
+
+            if (_regionLookupPending && _regionLookupHost == systemPanelWindow)
+                return;
+
+            _regionLookupPending = true;
+            _regionLookupHost = systemPanelWindow;
+            requestVersion = ++_regionLookupVersion;
+            var timing = System.Diagnostics.Stopwatch.StartNew();
+            bool reusedPlacement = SystemCalendarPlacementCache.Shared.TryGetPlacement(systemPanelWindow, out var cachedBounds);
+            OverlayTiming.Write($"OPEN {requestVersion} cache={reusedPlacement} ms={timing.ElapsedMilliseconds}");
+            var boundsQuery = reusedPlacement
+                ? Task.FromResult<Rect?>(cachedBounds)
+                : SystemCalendarRegionLocator.FindAsync(systemPanelWindow);
+            var preparedPopup = GetSystemPopup();
+            preparedPopup.PrepareSystemOverlay(systemPanelWindow);
+            candidate = preparedPopup;
+            var bounds = await boundsQuery;
+            // SHOW/UNCLOAK 也可能早于卡片滑入动画结束；连续两次相同才操作其显示区域。
+            Rect? previousBounds = null;
+            for (int attempt = 0; !reusedPlacement && attempt < 5 && (bounds is null || bounds != previousBounds); attempt++)
             {
-                // 已显示则只激活，不重新创建
-                _popup.Activate();
+                previousBounds = bounds;
+                await Task.Delay(100);
+                if (requestVersion != _regionLookupVersion ||
+                    !SystemCalendarInterceptor.IsSystemPanelVisible(systemPanelWindow))
+                    return;
+                bounds = await SystemCalendarRegionLocator.FindAsync(systemPanelWindow);
+            }
+            if (requestVersion != _regionLookupVersion ||
+                !SystemCalendarInterceptor.IsSystemPanelVisible(systemPanelWindow))
+                return;
+
+            if (bounds is null || (!reusedPlacement && bounds != previousBounds))
+            {
+                SystemCalendarPlacementCache.Shared.Invalidate(systemPanelWindow);
+                _hasShownSystemPanel = false;
+                ApplyTrayIconVisibility(AppSettings.Load().ShowTrayIcon,
+                    _interceptor?.IsHookInstalled ?? false);
                 return;
             }
 
-            _popup?.Close();
-            _popup = new PopupWindow();
-            _popup.Show();
-            WindowPositionHelper.PositionNearTaskbar(_popup);
-            _popup.Activate();
+            OverlayTiming.Write($"OPEN {requestVersion} bounds_ready ms={timing.ElapsedMilliseconds}");
 
-            // 延迟启动焦点跟踪定时器，给窗口时间获取焦点
-            Dispatcher.BeginInvoke(new Action(() =>
+            if (_popup is not null && _popup != preparedPopup) _popup.Close();
+            var popup = preparedPopup;
+            candidate = popup;
+            _popup = popup;
+            popup.SetSystemCalendarBounds(bounds.Value);
+            // 先定位隐藏的自家窗口，避免首帧出现在原生日历左侧。
+            popup.UpdatePosition();
+            popup.Show();
+            popup.UpdatePosition();
+            popup.StartFocusTracking();
+
+            // Remember the native shape before opening the calendar hole. Only the first
+            // verified layout uses UIA; later opens can reuse it without waiting for animation.
+            if (!reusedPlacement)
+                SystemCalendarPlacementCache.Shared.Remember(systemPanelWindow, bounds.Value);
+            bool enabled = await popup.EnableCalendarReplacementAsync(reusedPlacement);
+            OverlayTiming.Write($"OPEN {requestVersion} enabled={enabled} cache={reusedPlacement} ms={timing.ElapsedMilliseconds}");
+            if (requestVersion != _regionLookupVersion) return;
+            if (popup.IsSystemPanelDismissing) return;
+            if (!popup.IsVisible ||
+                !SystemCalendarInterceptor.IsSystemPanelVisible(systemPanelWindow))
             {
-                _popup?.StartFocusTracking();
-            }), System.Windows.Threading.DispatcherPriority.Loaded);
+                // Closing during preparation is a normal cancellation, not a bad placement.
+                popup.Hide();
+                return;
+            }
+            if (!enabled)
+            {
+                popup.Hide();
+                SystemCalendarPlacementCache.Shared.Invalidate(systemPanelWindow);
+                _hasShownSystemPanel = false;
+                ApplyTrayIconVisibility(AppSettings.Load().ShowTrayIcon,
+                    _interceptor?.IsHookInstalled ?? false);
+                if (reusedPlacement && SystemCalendarInterceptor.IsSystemPanelVisible(systemPanelWindow))
+                    _ = Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        if (requestVersion == _regionLookupVersion &&
+                            SystemCalendarInterceptor.IsSystemPanelVisible(systemPanelWindow))
+                            ShowPopup(systemPanelWindow);
+                    }));
+                return;
+            }
+            if (SystemCalendarInterceptor.IsSystemPanelVisible(systemPanelWindow))
+            {
+                _hasShownSystemPanel = true;
+                ApplyTrayIconVisibility(AppSettings.Load().ShowTrayIcon,
+                    _interceptor?.IsHookInstalled ?? false);
+            }
         }
         catch (Exception ex)
         {
             System.Diagnostics.Debug.WriteLine($"WinCal: ShowPopup error: {ex}");
-            _popup = null;
+            if (requestVersion == _regionLookupVersion)
+            {
+                SystemCalendarPlacementCache.Shared.Invalidate(systemPanelWindow);
+                candidate?.Close();
+                if (_popup == candidate) _popup = null;
+                if (_systemPopup == candidate) _systemPopup = null;
+                _hasShownSystemPanel = false;
+                ApplyTrayIconVisibility(AppSettings.Load().ShowTrayIcon,
+                    _interceptor?.IsHookInstalled ?? false);
+            }
+        }
+        finally
+        {
+            if (requestVersion != 0 && requestVersion == _regionLookupVersion)
+                _regionLookupPending = false;
         }
     }
 
@@ -193,14 +344,18 @@ public partial class App : Application
     /// </summary>
     private void TogglePopup()
     {
+        // 托盘是用户的显式操作，取消任何尚未完成的原生面板显示请求。
+        _regionLookupVersion++;
+        _regionLookupPending = false;
         try
         {
             if (_popup == null || !_popup.IsVisible)
             {
-                _popup?.Close();
+                if (_popup == _systemPopup) _popup?.Hide();
+                else _popup?.Close();
                 _popup = new PopupWindow();
                 _popup.Show();
-                WindowPositionHelper.PositionNearTaskbar(_popup);
+                _popup.UpdatePosition();
                 _popup.Activate();
                 _popup.StartFocusTracking();
             }
@@ -218,8 +373,18 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        _regionLookupVersion++;
+        NativeCalendarRegionLease.StopWarmGuardian();
+        _popup?.Close();
+        if (_systemPopup != _popup) _systemPopup?.Close();
         _interceptor?.Dispose();
         _trayIcon?.Dispose();
+        if (_instanceMutex is not null)
+        {
+            _instanceMutex.ReleaseMutex();
+            _instanceMutex.Dispose();
+            _instanceMutex = null;
+        }
         base.OnExit(e);
     }
 }

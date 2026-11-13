@@ -1,75 +1,77 @@
-using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
-using System.Windows;
+using System.Text;
 using System.Windows.Threading;
 
 namespace WinCal.Core.Helpers;
 
 /// <summary>
-/// 监控并替换 Windows 系统日历弹窗。
-/// 当检测到系统日历/通知中心弹出时，立即隐藏它并触发我们的日历面板。
+/// 观察 Windows 系统日历 / 通知面板的显示，触发 miniCal 日历替换流程。
+/// 此类只读取原生窗口状态，不隐藏、激活或修改原生窗口。
 /// </summary>
-public class SystemCalendarInterceptor : IDisposable
+public sealed class SystemCalendarInterceptor : IDisposable
 {
-    private IntPtr _hook;
-    private GCHandle _gcHandle;
+    private readonly object _stateLock = new();
     private readonly Dispatcher _dispatcher;
-    private Action? _showPopupCallback;
+    private IntPtr _hook;
+    private GCHandle _callbackHandle;
+    private Action<IntPtr>? _showPopupCallback;
     private bool _disposed;
-    private DateTime _lastInterceptTime;
-    private static readonly TimeSpan InterceptCooldown = TimeSpan.FromMilliseconds(500);
-    private readonly HashSet<IntPtr> _hiddenWindows = new();
+    private bool _notificationQueued;
+    private IntPtr _pendingHost;
 
-    // Win32 常量
-    private const uint EVENT_MIN = 0x0001;  // EVENT_MIN
     private const uint EVENT_OBJECT_SHOW = 0x8002;
-    private const uint EVENT_OBJECT_HIDE = 0x8003;
-    private const uint EVENT_OBJECT_CREATE = 0x8001;
+    private const uint EVENT_OBJECT_LOCATIONCHANGE = 0x800B;
     private const uint EVENT_OBJECT_UNCLOAK = 0x8018;
-    private const uint EVENT_OBJECT_CLOAK = 0x8017;
-    private const uint EVENT_OBJECT_NAMECHANGE = 0x800C;
-    private const uint EVENT_OBJECT_STATECHANGE = 0x800A;
-    private const uint EVENT_MAX = 0x80FF;
-    private const int WINEVENT_OUTOFCONTEXT = 0;
-    private const int SW_HIDE = 0;
-    private const int SW_SHOW = 5;
+    private const uint WINEVENT_OUTOFCONTEXT = 0;
+    private const uint DWMWA_CLOAKED = 14;
 
-    // Win32 API
-    [DllImport("user32.dll")]
+    [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr SetWinEventHook(
-        uint eventMin, uint eventMax,
-        IntPtr hmodWinEventProc,
-        WinEventDelegate lpfnWinEventProc,
-        uint idProcess, uint idThread,
-        uint dwFlags);
+        uint eventMin, uint eventMax, IntPtr hmodWinEventProc,
+        WinEventDelegate lpfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
 
-    [DllImport("user32.dll")]
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool UnhookWinEvent(IntPtr hWinEventHook);
 
     [DllImport("user32.dll")]
-    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindow(IntPtr hwnd);
 
     [DllImport("user32.dll")]
-    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindowVisible(IntPtr hwnd);
 
     [DllImport("user32.dll")]
-    private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmGetWindowAttribute(
+        IntPtr hwnd, uint attribute, out uint value, int valueSize);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    private static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
+    private static extern int GetClassName(IntPtr hwnd, StringBuilder className, int maxCount);
 
     [DllImport("user32.dll")]
-    private static extern bool IsWindowVisible(IntPtr hWnd);
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    private static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
 
-    [DllImport("user32.dll")]
-    private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
-
-    [DllImport("user32.dll")]
-    private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT
+    {
+        public int Left, Top, Right, Bottom;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct MONITORINFO
@@ -81,273 +83,208 @@ public class SystemCalendarInterceptor : IDisposable
     }
 
     private delegate void WinEventDelegate(
-        IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
-        int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct RECT
-    {
-        public int Left, Top, Right, Bottom;
-    }
+        IntPtr hook, uint eventType, IntPtr hwnd, int idObject, int idChild,
+        uint eventThread, uint eventTime);
 
     public SystemCalendarInterceptor(Dispatcher dispatcher)
     {
-        _dispatcher = dispatcher;
+        _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
     }
 
     /// <summary>
-    /// 启动拦截器，传入弹出日历面板的回调
+    /// 钩子安装成功时，点击任务栏时钟可作为隐藏托盘图标后的入口。
     /// </summary>
-    private static void Log(string msg) => Debug.WriteLine(msg);
-
-    /// <summary>
-    /// WinEvent 钩子是否已成功安装。
-    /// 隐藏托盘图标前必须检查此项：钩子失败时「点击任务栏时钟」无法唤出面板，
-    /// 隐藏图标会让应用失去全部入口。
-    /// </summary>
-    public bool IsHookInstalled => _hook != IntPtr.Zero;
-
-    public void Start(Action showPopupCallback)
+    public bool IsHookInstalled
     {
-        _showPopupCallback = showPopupCallback;
-
-        // 使用 GC handle 防止委托被垃圾回收
-        _gcHandle = GCHandle.Alloc(new WinEventDelegate(WinEventProc));
-
-        // 捕获委托引用
-        var callback = (WinEventDelegate)_gcHandle.Target!;
-
-        // 监听更广范围的事件（捕捉系统日历的各种显示方式）
-        _hook = SetWinEventHook(
-            EVENT_OBJECT_SHOW, EVENT_MAX,
-            IntPtr.Zero, callback,
-            0, 0,
-            WINEVENT_OUTOFCONTEXT);
-
-        if (_hook == IntPtr.Zero)
-        {
-            Log("WinCal: ✗ Failed to set WinEvent hook!");
-        }
-        else
-        {
-            Log("WinCal: ✓ SystemCalendarInterceptor started, hook=" + _hook);
-        }
+        get { lock (_stateLock) return !_disposed && _hook != IntPtr.Zero; }
     }
 
     /// <summary>
-    /// WinEvent 回调 —— 在调用者的线程上下文中执行（WINEVENT_OUTOFCONTEXT）
+    /// 开始观察系统面板，将其原生窗口句柄传给 miniCal 的显示回调。
+    /// 重复调用只更新回调，不重复安装钩子。
     /// </summary>
-    private static readonly Dictionary<uint, string> EventTypeNames = new()
+    public void Start(Action<IntPtr> showPopupCallback)
     {
-        [0x8001] = "CREATE",
-        [0x8002] = "SHOW",
-        [0x8003] = "HIDE",
-        [0x8004] = "DESTROY",
-        [0x8006] = "LOCATIONCHANGE",
-        [0x800A] = "STATECHANGE",
-        [0x800C] = "NAMECHANGE",
-        [0x8017] = "CLOAK",
-        [0x8018] = "UNCLOAK",
-    };
+        ArgumentNullException.ThrowIfNull(showPopupCallback);
+
+        lock (_stateLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            _showPopupCallback = showPopupCallback;
+            if (_hook != IntPtr.Zero) return;
+
+            var callback = new WinEventDelegate(WinEventProc);
+            _callbackHandle = GCHandle.Alloc(callback);
+            try
+            {
+                // WinEvent 仅支持连续范围，在回调中筛选显示、解除隐藏和位置变化。
+                _hook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAK,
+                    IntPtr.Zero, callback, 0, 0, WINEVENT_OUTOFCONTEXT);
+                if (_hook == IntPtr.Zero)
+                {
+                    Debug.WriteLine($"WinCal: System panel observer hook failed: {Marshal.GetLastWin32Error()}");
+                    _callbackHandle.Free();
+                }
+            }
+            catch
+            {
+                if (_callbackHandle.IsAllocated) _callbackHandle.Free();
+                throw;
+            }
+        }
+        // Single-file startup can finish after the user's clock click. Observe an already open
+        // native foreground panel too; waiting only for the next SHOW would miss this session.
+        QueuePanelShown(GetForegroundWindow());
+    }
 
     private void WinEventProc(
-        IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
-        int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
+        IntPtr hook, uint eventType, IntPtr hwnd, int idObject, int idChild,
+        uint eventThread, uint eventTime)
     {
         try
         {
-            // 只关心窗口级别的对象（idObject == 0）
-            if (idObject != 0 || hwnd == IntPtr.Zero)
+            if (idObject != 0 || idChild != 0 || hwnd == IntPtr.Zero ||
+                eventType is not (EVENT_OBJECT_SHOW or EVENT_OBJECT_UNCLOAK or EVENT_OBJECT_LOCATIONCHANGE))
                 return;
 
-            // 获取进程信息来快速过滤
-            GetWindowThreadProcessId(hwnd, out uint processId);
-            string? procName = null;
-            try { procName = Process.GetProcessById((int)processId).ProcessName; } catch { }
-
-            // 记录 ShellExperienceHost 的所有事件
-            if (string.Equals(procName, "ShellExperienceHost", StringComparison.OrdinalIgnoreCase))
+            lock (_stateLock)
             {
-                var className = new System.Text.StringBuilder(256);
-                GetClassName(hwnd, className, 256);
-                GetWindowRect(hwnd, out var r);
-                var evtName = EventTypeNames.GetValueOrDefault(eventType, $"0x{eventType:X}");
-                Log($"★★★ ShellExperienceHost evt={evtName}(0x{eventType:X}) hwnd={hwnd} idObj={idObject} idChild={idChild} " +
-                    $"Class='{className}' Rect:({r.Left},{r.Top})-({r.Right},{r.Bottom})");
+                if (_disposed || _hook == IntPtr.Zero) return;
             }
 
-            // 只处理可能触发的显示事件
-            if (eventType is not (0x8002 or 0x8001 or 0x8018 or 0x800A or 0x800C))
-                return;
-
-            // 检查是否是系统日历/通知中心窗口
-            // 注意：不检查 IsWindowVisible，因为 UNCLOAK 事件时窗口可能尚未完全可见
-            if (!IsSystemCalendarWindow(hwnd))
-                return;
-
-            // 防抖：500ms 内只处理第一次拦截
-            var now = DateTime.UtcNow;
-            if (now - _lastInterceptTime < InterceptCooldown)
-            {
-                Log($"Cooldown: skipping duplicate intercept ({(now - _lastInterceptTime).TotalMilliseconds:F0}ms)");
-                // 仍然隐藏系统窗口
-                ShowWindow(hwnd, SW_HIDE);
-                return;
-            }
-            _lastInterceptTime = now;
-
-            Log($"Detected system calendar window: {hwnd}");
-
-            // 立即隐藏系统日历窗口，并记录句柄以便退出时恢复
-            ShowWindow(hwnd, SW_HIDE);
-            lock (_hiddenWindows)
-            {
-                _hiddenWindows.Add(hwnd);
-            }
-
-            // 在 UI 线程上触发我们的日历面板
-            _dispatcher.BeginInvoke(new Action(() =>
-            {
-                Log("Firing ShowPopup callback on UI thread");
-                _showPopupCallback?.Invoke();
-            }));
+            QueuePanelShown(hwnd);
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"WinCal: WinEventProc error: {ex.Message}");
+            lock (_stateLock)
+            {
+                _notificationQueued = false;
+                _pendingHost = IntPtr.Zero;
+            }
+            Debug.WriteLine($"WinCal: System panel observer callback failed: {ex.Message}");
+        }
+    }
+
+    private void QueuePanelShown(IntPtr hwnd)
+    {
+        if (!IsSystemPanelWindow(hwnd)) return;
+        lock (_stateLock)
+        {
+            if (_disposed || _hook == IntPtr.Zero || _dispatcher.HasShutdownStarted || _dispatcher.HasShutdownFinished) return;
+            _pendingHost = hwnd;
+            if (_notificationQueued) return;
+            _notificationQueued = true;
+        }
+        // 合并同一轮 SHOW / UNCLOAK / LOCATIONCHANGE，也用于补上启动前已发生的显示。
+        _dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(NotifyPanelShown));
+    }
+
+    private void NotifyPanelShown()
+    {
+        IntPtr host;
+        Action<IntPtr>? callback;
+        lock (_stateLock)
+        {
+            _notificationQueued = false;
+            host = _pendingHost;
+            _pendingHost = IntPtr.Zero;
+            if (_disposed) return;
+            callback = _showPopupCallback;
+        }
+
+        // 原生面板可能在 dispatcher 执行前已收起、cloaked 或销毁；禁止迟到的显示。
+        if (IsSystemPanelVisible(host) && IsSystemPanelWindow(host))
+        {
+            lock (_stateLock)
+            {
+                if (_disposed) return;
+            }
+            callback?.Invoke(host);
         }
     }
 
     /// <summary>
-    /// 判断窗口是否是 Windows 系统日历/通知中心
+    /// 判断原生面板句柄是否仍存在、可见且未被 DWM cloak。
+    /// 状态无法确认时返回 false，由调用方收起跟随面板。
     /// </summary>
-    private static bool IsSystemCalendarWindow(IntPtr hwnd)
+    public static bool IsSystemPanelVisible(IntPtr hwnd)
     {
-        // 获取进程 ID
-        GetWindowThreadProcessId(hwnd, out uint processId);
+        if (hwnd == IntPtr.Zero || !IsWindow(hwnd) || !IsWindowVisible(hwnd)) return false;
 
-        // 获取进程名
-        string? processName = null;
         try
         {
-            var proc = Process.GetProcessById((int)processId);
-            processName = proc.ProcessName;
+            return DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, out uint cloaked, sizeof(uint)) == 0 &&
+                   cloaked == 0;
         }
-        catch
-        {
-            return false;
-        }
-
-        // 调试：记录所有可见窗口
-        var className = new System.Text.StringBuilder(256);
-        GetClassName(hwnd, className, 256);
-        var classStr = className.ToString();
-
-        var title = new System.Text.StringBuilder(256);
-        GetWindowText(hwnd, title, 256);
-
-        GetWindowRect(hwnd, out var rectInfo);
-        Log($"Window shown - PID:{processId}({processName}) " +
-            $"Class:'{classStr}' Title:'{title}' " +
-            $"Rect:({rectInfo.Left},{rectInfo.Top})-({rectInfo.Right},{rectInfo.Bottom})");
-
-        // Windows 11: 系统日历/通知中心属于 ShellExperienceHost 进程
-        // Windows 10: 可能属于 ShellExperienceHost 或 SearchUI
-        if (!string.Equals(processName, "ShellExperienceHost", StringComparison.OrdinalIgnoreCase))
-            return false;
-
-        // 系统日历窗口的类名通常是 Windows.UI.Core.CoreWindow
-        // 放宽匹配：只要是右下角的 ShellExperienceHost 窗口就拦截
-        if (!classStr.StartsWith("Windows.UI.Core.CoreWindow", StringComparison.OrdinalIgnoreCase))
-            return false;
-
-        // 获取窗口位置 —— 系统日历在屏幕右下角
-        if (!GetWindowRect(hwnd, out var rect))
-            return false;
-
-        var windowWidth = rect.Right - rect.Left;
-        var windowHeight = rect.Bottom - rect.Top;
-
-        // 使用 MonitorFromWindow 获取窗口所在显示器（支持多显示器）
-        var monitor = MonitorFromWindow(hwnd, 0 /* MONITOR_DEFAULTTONULL */);
-        if (monitor == IntPtr.Zero)
-        {
-            Log("ShellExperienceHost: MonitorFromWindow returned null");
-            return false;
-        }
-
-        var monitorInfo = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
-        if (!GetMonitorInfo(monitor, ref monitorInfo))
-        {
-            Log("ShellExperienceHost: GetMonitorInfo failed");
-            return false;
-        }
-
-        var workArea = monitorInfo.rcWork;
-
-        Log($"ShellExperienceHost window - " +
-            $"Size:{windowWidth}x{windowHeight} " +
-            $"Monitor WorkArea:({workArea.Left},{workArea.Top})-({workArea.Right},{workArea.Bottom}) " +
-            $"RightDiff:{Math.Abs(rect.Right - workArea.Right)} " +
-            $"BottomDiff:{Math.Abs(rect.Bottom - workArea.Bottom)}");
-
-        // 系统日历/通知中心窗口特征：
-        // 1. 右边缘贴近显示器工作区右边缘（允许 50px 误差，考虑不同 DPI）
-        // 2. 底部贴近任务栏顶部（允许 50px 误差）
-        // 3. 窗口宽度 > 200px
-        // 4. 窗口高度 > 100px
-        var rightAligned = Math.Abs(rect.Right - workArea.Right) < 50;
-        var bottomAligned = Math.Abs(rect.Bottom - workArea.Bottom) < 50;
-        var validSize = windowWidth > 200 && windowHeight > 100;
-
-        if (rightAligned && bottomAligned && validSize)
-        {
-            Log("✓ System calendar INTERCEPTED!");
-            return true;
-        }
-
-        return false;
+        catch (DllNotFoundException) { return false; }
+        catch (EntryPointNotFoundException) { return false; }
     }
 
-    /// <summary>
-    /// 恢复所有被隐藏的系统日历窗口，确保退出后系统日历正常工作
-    /// </summary>
-    public void RestoreHiddenWindows()
+    private static bool IsSystemPanelWindow(IntPtr hwnd)
     {
-        lock (_hiddenWindows)
+        if (!IsWindow(hwnd)) return false;
+        GetWindowThreadProcessId(hwnd, out uint processId);
+        if (processId == 0) return false;
+
+        try
         {
-            foreach (var hwnd in _hiddenWindows)
-            {
-                try
-                {
-                    ShowWindow(hwnd, SW_SHOW);
-                    Log($"Restored hidden window: {hwnd}");
-                }
-                catch { }
-            }
-            _hiddenWindows.Clear();
+            using var process = Process.GetProcessById((int)processId);
+            if (!string.Equals(process.ProcessName, "ShellExperienceHost", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(process.ProcessName, "ShellHost", StringComparison.OrdinalIgnoreCase))
+                return false;
         }
+        catch (ArgumentException) { return false; }
+        catch (InvalidOperationException) { return false; }
+        catch (System.ComponentModel.Win32Exception) { return false; }
+
+        var className = new StringBuilder(256);
+        if (GetClassName(hwnd, className, className.Capacity) == 0 ||
+            !string.Equals(className.ToString(), "Windows.UI.Core.CoreWindow", StringComparison.Ordinal))
+            return false;
+
+        if (!GetWindowRect(hwnd, out var bounds)) return false;
+        var monitor = MonitorFromWindow(hwnd, 0 /* MONITOR_DEFAULTTONULL */);
+        var info = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+        if (monitor == IntPtr.Zero || !GetMonitorInfo(monitor, ref info)) return false;
+
+        int width = bounds.Right - bounds.Left;
+        int height = bounds.Bottom - bounds.Top;
+        int monitorWidth = info.rcMonitor.Right - info.rcMonitor.Left;
+        int monitorHeight = info.rcMonitor.Bottom - info.rcMonitor.Top;
+        // 排除零尺寸、越出显示器及全屏 Shell 窗口，避免把其他系统 UI 当成通知面板。
+        if (width <= 200 || height <= 100 || width > monitorWidth * 0.8 || height > monitorHeight)
+            return false;
+
+        const int edgeTolerance = 64;
+        bool rightAligned = Math.Abs((long)bounds.Right - info.rcWork.Right) <= edgeTolerance ||
+                            Math.Abs((long)bounds.Right - info.rcMonitor.Right) <= edgeTolerance;
+        bool bottomAligned = Math.Abs((long)bounds.Bottom - info.rcWork.Bottom) <= edgeTolerance ||
+                             Math.Abs((long)bounds.Bottom - info.rcMonitor.Bottom) <= edgeTolerance;
+        return rightAligned && bottomAligned;
     }
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
-
-        // 退出前恢复被隐藏的系统窗口
-        RestoreHiddenWindows();
-
-        if (_hook != IntPtr.Zero)
+        lock (_stateLock)
         {
-            UnhookWinEvent(_hook);
+            if (_disposed) return;
+            _disposed = true;
+            _showPopupCallback = null;
+            _pendingHost = IntPtr.Zero;
+            _notificationQueued = false;
+
+            bool unhooked = _hook == IntPtr.Zero || UnhookWinEvent(_hook);
             _hook = IntPtr.Zero;
+            if (unhooked)
+            {
+                if (_callbackHandle.IsAllocated) _callbackHandle.Free();
+            }
+            else
+            {
+                // 若系统拒绝解除钩子，保留委托根引用，避免原生回调落到已回收内存。
+                // _disposed 仍会使残留回调立即返回。
+                Debug.WriteLine($"WinCal: System panel observer unhook failed: {Marshal.GetLastWin32Error()}");
+            }
         }
-
-        if (_gcHandle.IsAllocated)
-        {
-            _gcHandle.Free();
-        }
-
-        Debug.WriteLine("WinCal: SystemCalendarInterceptor disposed");
     }
 }

@@ -3,6 +3,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
 using System.Windows.Threading;
 using WinCal.Core.Helpers;
 using WinCal.Core.Models;
@@ -16,10 +17,32 @@ public partial class PopupWindow : Window
 {
     private readonly CalendarViewModel _calendarViewModel;
     private readonly AppSettings _settings;
+    private IntPtr _systemPanelWindow;
+    private readonly bool _systemOverlayMode;
+    private bool _settingsApplied;
+    private int _overlaySession;
+    private Rect? _calendarOverlayBounds;
+    private bool _updatingPosition;
+    private bool _regionRefreshPending;
+    private DateTime _lastRegionRefresh;
+    private NativeCalendarRegionLease? _calendarRegionLease;
+    private CancellationTokenSource? _replacementPreparation;
     private EventDetailWindow? _detailWindow;
+    private readonly SystemPanelDismissalState _dismissalState = new();
+    private readonly TranslateTransform _dismissalTransform = new();
+    private SystemPanelLifecycleObserver? _systemPanelObserver;
+    private Task _regionReleaseTask = Task.CompletedTask;
 
-    public PopupWindow()
+    public IntPtr SystemPanelWindow => _systemPanelWindow;
+    public bool IsSystemPanelDismissing => _dismissalState.IsDismissing;
+    public event EventHandler? CalendarOverlayUnavailable;
+
+    public PopupWindow(IntPtr systemPanelWindow = default, Rect? calendarOverlayBounds = null,
+        bool prepareSystemOverlay = false)
     {
+        _systemPanelWindow = systemPanelWindow;
+        _systemOverlayMode = prepareSystemOverlay || systemPanelWindow != IntPtr.Zero;
+        _calendarOverlayBounds = calendarOverlayBounds;
         // 加载设置
         _settings = AppSettings.Load();
 
@@ -27,6 +50,16 @@ public partial class PopupWindow : Window
         _calendarViewModel = new CalendarViewModel();
 
         InitializeComponent();
+
+        if (_systemOverlayMode)
+        {
+            WindowActivationHelper.PreventActivation(this);
+            RootBorder.RenderTransform = _dismissalTransform;
+            // 覆盖原生日历卡片时使用精确尺寸，事件列表占用月历下方的剩余空间。
+            SizeToContent = SizeToContent.Manual;
+            CalendarEventsRow.Height = new GridLength(1, GridUnitType.Star);
+            EventListHeightRow.Height = new GridLength(1, GridUnitType.Star);
+        }
 
         // 设置 DataContext
         DataContext = _calendarViewModel;
@@ -44,11 +77,127 @@ public partial class PopupWindow : Window
 
         // 在 PopupWindow 级别捕获鼠标事件，显示事件详情
         PreviewMouseMove += OnPreviewMouseMove;
+
+        IsVisibleChanged += (_, _) =>
+        {
+            if (!IsVisible)
+            {
+                ReleaseCalendarRegion();
+                CloseDetailWindow();
+                StopFocusTracking();
+            }
+        };
+    }
+
+    /// <summary>Build the hidden HWND and date cells without showing or modifying the system panel.</summary>
+    public void WarmSystemOverlay()
+    {
+        if (!_systemOverlayMode || IsVisible) return;
+        if (!_settingsApplied)
+        {
+            ApplySettings();
+            _settingsApplied = true;
+        }
+        new System.Windows.Interop.WindowInteropHelper(this).EnsureHandle();
+        RootBorder.Measure(new Size(Width, MaxHeight));
+        RootBorder.Arrange(new Rect(RootBorder.DesiredSize));
+        RootBorder.UpdateLayout();
+    }
+
+    public void PrepareSystemOverlay(IntPtr host)
+    {
+        if (!_systemOverlayMode || IsVisible) throw new InvalidOperationException("Overlay is already visible.");
+        ReleaseCalendarRegion();
+        _systemPanelWindow = host;
+        _calendarOverlayBounds = null;
+        _calendarViewModel.NavigateToToday();
+    }
+
+    public void SetSystemCalendarBounds(Rect bounds)
+    {
+        _calendarOverlayBounds = bounds;
+        UpdatePosition();
+    }
+
+    /// <summary>
+    /// Shell 使用高于普通 Topmost 的窗口层级。准备独立恢复守护后，仅让出原生日历区域。
+    /// </summary>
+    public async Task<bool> EnableCalendarReplacementAsync(bool reuseCachedPlacement = false)
+    {
+        if (_systemPanelWindow == IntPtr.Zero || _calendarOverlayBounds is not Rect bounds || !IsVisible)
+            return false;
+
+        int session = _overlaySession;
+        IntPtr host = _systemPanelWindow;
+        // A rapid reopen waits for the previous DISARM without blocking the dispatcher.
+        // A late, cancelled preparation may also add a release while this await is pending.
+        Task release;
+        do
+        {
+            release = _regionReleaseTask;
+            await release;
+        } while (release != _regionReleaseTask);
+        if (session != _overlaySession || host != _systemPanelWindow || !IsVisible ||
+            _dismissalState.IsDismissing || !SystemCalendarInterceptor.IsSystemPanelVisible(host))
+            return false;
+
+        using var preparation = new CancellationTokenSource();
+        _replacementPreparation = preparation;
+        NativeCalendarRegionLease? lease;
+        try
+        {
+            lease = await NativeCalendarRegionLease.TryCreateAsync(host, bounds, preparation.Token, reuseCachedPlacement);
+        }
+        finally
+        {
+            if (_replacementPreparation == preparation) _replacementPreparation = null;
+        }
+        if (lease is null) return false;
+        if (session != _overlaySession || host != _systemPanelWindow ||
+            !IsVisible || _dismissalState.IsDismissing || !SystemCalendarInterceptor.IsSystemPanelVisible(host))
+        {
+            TrackRegionRelease(lease);
+            return false;
+        }
+
+        _calendarRegionLease = lease;
+        // 守护启动期间卡片位置可能改变，最后再按当前已验证的位置同步。
+        UpdatePosition();
+        return IsVisible && _calendarRegionLease?.IsHealthy == true;
+    }
+
+    private void ReleaseCalendarRegion()
+    {
+        _overlaySession++;
+        _regionRefreshPending = false;
+        _lastRegionRefresh = default;
+        _replacementPreparation?.Cancel();
+        var lease = _calendarRegionLease;
+        _calendarRegionLease = null;
+        if (lease is not null) TrackRegionRelease(lease);
+    }
+
+    private void TrackRegionRelease(NativeCalendarRegionLease lease)
+    {
+        Task release = lease.DisposeAsync();
+        _regionReleaseTask = _regionReleaseTask.IsCompleted
+            ? release : Task.WhenAll(_regionReleaseTask, release);
+    }
+
+    private void CalendarReplacementFailed()
+    {
+        SystemCalendarPlacementCache.Shared.Invalidate(_systemPanelWindow);
+        Hide();
+        CalendarOverlayUnavailable?.Invoke(this, EventArgs.Empty);
     }
 
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
-        ApplySettings();
+        if (!_settingsApplied)
+        {
+            ApplySettings();
+            _settingsApplied = true;
+        }
         UpdateNoEventsVisibility();
     }
 
@@ -57,7 +206,34 @@ public partial class PopupWindow : Window
     /// </summary>
     private void OnSizeChanged(object sender, SizeChangedEventArgs e)
     {
-        WindowPositionHelper.PositionNearTaskbar(this);
+        UpdatePosition();
+    }
+
+    public void UpdatePosition()
+    {
+        if (_updatingPosition || _dismissalState.IsDismissing) return;
+        _updatingPosition = true;
+        try
+        {
+            if (_systemOverlayMode)
+            {
+                if (_calendarOverlayBounds is Rect bounds)
+                {
+                    WindowPositionHelper.PositionOverSystemCalendar(this, bounds);
+                    if (_calendarRegionLease is not null && !_calendarRegionLease.Update(bounds))
+                        CalendarReplacementFailed();
+                }
+            }
+            else
+                WindowPositionHelper.PositionNearTaskbar(this);
+
+            if (_detailWindow?.IsVisible == true)
+                _detailWindow.UpdatePosition(this);
+        }
+        finally
+        {
+            _updatingPosition = false;
+        }
     }
 
     /// <summary>
@@ -115,17 +291,33 @@ public partial class PopupWindow : Window
 
         // 记录当前前台窗口（通常是桌面/任务栏/ShellExperienceHost）
         _initialForegroundWindow = GetForegroundWindow();
+        // A cached placement can be displayed while Shell is still animating. Observe the
+        // settled layout in the background rather than moving to an intermediate UIA rectangle.
+        _lastRegionRefresh = DateTime.UtcNow;
 
-        _focusTimer = new DispatcherTimer
+        _focusTimer = new DispatcherTimer(DispatcherPriority.Input)
         {
-            Interval = TimeSpan.FromMilliseconds(200)
+            Interval = TimeSpan.FromMilliseconds(_systemOverlayMode ? 32 : 200)
         };
         _focusTimer.Tick += OnFocusCheckTick;
         _focusTimer.Start();
+        if (_systemPanelWindow != IntPtr.Zero)
+        {
+            _systemPanelObserver = new SystemPanelLifecycleObserver(
+                _systemPanelWindow, Dispatcher, () =>
+                {
+                    if (IsVisible) CheckSystemPanelDismissal();
+                });
+            CheckSystemPanelDismissal();
+        }
     }
 
     private void StopFocusTracking()
     {
+        _systemPanelObserver?.Dispose();
+        _systemPanelObserver = null;
+        _dismissalState.Reset();
+        CancelDismissalAnimation();
         if (_focusTimer != null)
         {
             _focusTimer.Stop();
@@ -134,8 +326,142 @@ public partial class PopupWindow : Window
         }
     }
 
-    private void OnFocusCheckTick(object? sender, EventArgs e)
+    private bool CheckSystemPanelDismissal()
     {
+        if (!IsVisible || _systemPanelWindow == IntPtr.Zero) return true;
+        IntPtr foreground = GetForegroundWindow();
+        bool nativeForeground = foreground == _systemPanelWindow ||
+            (foreground != IntPtr.Zero && GetWindow(foreground, GW_OWNER) == _systemPanelWindow);
+        var action = _dismissalState.Observe(
+            SystemCalendarInterceptor.IsSystemPanelVisible(_systemPanelWindow),
+            nativeForeground, foreground != IntPtr.Zero, SystemParameters.ClientAreaAnimation);
+        switch (action)
+        {
+            case SystemPanelDismissalAction.BeginAnimation:
+                BeginDismissalAnimation();
+                break;
+            case SystemPanelDismissalAction.CancelAnimation:
+                CancelDismissalAnimation();
+                break;
+            case SystemPanelDismissalAction.Hide:
+                OverlayTiming.Write("CLOSE native_hidden_or_motion_disabled");
+                Hide();
+                return true;
+        }
+        return _dismissalState.IsDismissing;
+    }
+
+    private void BeginDismissalAnimation()
+    {
+        int generation = _dismissalState.Generation;
+        CloseDetailWindow();
+        RootBorder.IsHitTestVisible = false;
+        OverlayTiming.Write($"CLOSE animation_begin generation={generation}");
+        // Animate our content inside the fixed, verified calendar rectangle. Neither the
+        // notification region nor the native region is changed on animation frames.
+        var animation = new DoubleAnimation(0, Math.Max(ActualWidth, Width),
+            TimeSpan.FromMilliseconds(120))
+        {
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseIn },
+            FillBehavior = FillBehavior.HoldEnd
+        };
+        animation.Completed += (_, _) =>
+        {
+            if (!IsVisible || generation != _dismissalState.Generation) return;
+            // A foreground notification may be queued behind the animation callback.
+            if (CheckSystemPanelDismissal() && _dismissalState.Complete(generation))
+            {
+                OverlayTiming.Write($"CLOSE animation_complete generation={generation}");
+                // Keep the now-transparent HWND and calendar hole until Shell hides. This
+                // prevents its own calendar from flashing during the remainder of the slide,
+                // and lets a rapid foreground return cancel dismissal without reopening.
+            }
+        };
+        _dismissalTransform.BeginAnimation(TranslateTransform.XProperty, animation);
+    }
+
+    private void CancelDismissalAnimation()
+    {
+        _dismissalTransform.BeginAnimation(TranslateTransform.XProperty, null);
+        _dismissalTransform.X = 0;
+        RootBorder.IsHitTestVisible = true;
+    }
+
+    private async void OnFocusCheckTick(object? sender, EventArgs e)
+    {
+        if (_systemPanelWindow != IntPtr.Zero)
+        {
+            if (CheckSystemPanelDismissal()) return;
+            if (_calendarRegionLease is not null && !_calendarRegionLease.IsHealthy)
+            {
+                CalendarReplacementFailed();
+                return;
+            }
+            // 覆盖模式保留通知中心的焦点和显示生命周期。
+            if (!SystemCalendarInterceptor.IsSystemPanelVisible(_systemPanelWindow))
+            {
+                Hide();
+                return;
+            }
+
+            // Closing animation can remain visible briefly after focus returns to the clock.
+            // Its partial UIA bounds must not overwrite a verified placement.
+            if (GetForegroundWindow() != _systemPanelWindow) return;
+
+            if (_regionRefreshPending || DateTime.UtcNow - _lastRegionRefresh < TimeSpan.FromMilliseconds(500))
+                return;
+
+            _regionRefreshPending = true;
+            _lastRegionRefresh = DateTime.UtcNow;
+            int session = _overlaySession;
+            IntPtr host = _systemPanelWindow;
+            try
+            {
+                var bounds = await SystemCalendarRegionLocator.FindAsync(host);
+                if (session != _overlaySession || host != _systemPanelWindow ||
+                    !IsVisible || _dismissalState.IsDismissing || !SystemCalendarInterceptor.IsSystemPanelVisible(host) ||
+                    GetForegroundWindow() != host)
+                    return;
+
+                if (bounds != _calendarOverlayBounds)
+                {
+                    // Recheck a changed/absent card after a frame-sized interval. A moving
+                    // rectangle belongs to Shell animation, not a new persistent layout.
+                    await Task.Delay(50);
+                    if (session != _overlaySession || host != _systemPanelWindow ||
+                        !IsVisible || _dismissalState.IsDismissing || !SystemCalendarInterceptor.IsSystemPanelVisible(host) ||
+                        GetForegroundWindow() != host)
+                        return;
+                    var confirmedBounds = await SystemCalendarRegionLocator.FindAsync(host);
+                    if (session != _overlaySession || host != _systemPanelWindow ||
+                        !IsVisible || _dismissalState.IsDismissing || !SystemCalendarInterceptor.IsSystemPanelVisible(host) ||
+                        GetForegroundWindow() != host || confirmedBounds != bounds)
+                        return;
+                }
+
+                if (bounds is null)
+                {
+                    OverlayTiming.Write("BACKGROUND bounds_null");
+                    // 无法确认边界时立即让出系统界面，禁止猜测坐标遮挡通知。
+                    CalendarReplacementFailed();
+                    return;
+                }
+
+                if (_calendarOverlayBounds != bounds)
+                {
+                    OverlayTiming.Write($"BACKGROUND bounds_changed old={_calendarOverlayBounds} new={bounds}");
+                    SystemCalendarPlacementCache.Shared.Invalidate(host);
+                }
+                _calendarOverlayBounds = bounds;
+                UpdatePosition();
+            }
+            finally
+            {
+                if (session == _overlaySession) _regionRefreshPending = false;
+            }
+            return;
+        }
+
         var foreground = GetForegroundWindow();
         var myHwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
 
@@ -165,6 +491,8 @@ public partial class PopupWindow : Window
     protected override void OnDeactivated(EventArgs e)
     {
         base.OnDeactivated(e);
+        if (_systemOverlayMode)
+            return;
         CloseDetailWindow();
         Hide();
         StopFocusTracking();
@@ -175,6 +503,7 @@ public partial class PopupWindow : Window
     /// </summary>
     private void OnPreviewMouseMove(object sender, MouseEventArgs e)
     {
+        if (_dismissalState.IsDismissing) return;
         var pos = e.GetPosition(this);
         var hitResult = VisualTreeHelper.HitTest(this, pos);
         if (hitResult == null)
@@ -240,7 +569,10 @@ public partial class PopupWindow : Window
     /// </summary>
     protected override void OnClosed(EventArgs e)
     {
-        CloseDetailWindow();
+        ReleaseCalendarRegion();
+        StopFocusTracking();
+        _detailWindow?.Close();
+        _detailWindow = null;
         base.OnClosed(e);
     }
 

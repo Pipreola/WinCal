@@ -10,7 +10,7 @@
 ## 功能特性
 
 - 🗓️ **系统托盘日历** — 点击任务栏时间区域即可弹出月历面板
-- 🔁 **系统日历替换** — 自动拦截 Windows 原生日历弹窗，替换为 WinCal 面板
+- 🔁 **原生通知兼容** — 点击任务栏时钟时保留上方 Windows 通知，用 WinCal 覆盖下方原生日历
 - 📅 **农历显示** — 每个日期格子下方显示农历日期
 - 📌 **事件展示** — 有事件的日期显示彩色圆点，面板下方列出近期日程
 - 🔍 **事件详情** — 鼠标悬停事件项，左侧弹出详情（标题、时间、地点、描述）
@@ -51,7 +51,7 @@ https://cdn.jsdelivr.net/npm/chinese-days/dist/holidays.ics
 | MVVM 架构 | 手写 `INotifyPropertyChanged`（已引入 CommunityToolkit.Mvvm 但尚未使用） |
 | Hardcodet.NotifyIcon.Wpf | 系统托盘图标 |
 | Ical.Net | ICS 日历文件解析 |
-| SetWinEventHook | 系统日历窗口拦截 |
+| SetWinEventHook | 观察系统面板显示，联动 WinCal 月历 |
 
 ## 项目结构
 
@@ -106,6 +106,35 @@ publish.bat
 
 ## 配置
 
+### 保留原生通知，替换日历区域
+
+点击任务栏时钟时，WinCal 通过 UI Automation 定位系统面板中的日历卡片，
+以相同位置和大小覆盖原生日历，保留上方原生通知。鼠标操作 WinCal 不主动切换前台焦点。
+关闭原生面板时，联动的 WinCal 和事件详情也会收起。
+收起开始时，WinCal 使用约 120ms 的向右退出动画；原生窗口提前隐藏时立即结束。
+快速重开会取消退出并复位，系统关闭界面动画时直接收起。原生动画没有公开逐帧进度，
+两者的运动曲线可能略有差异。
+托盘图标仍可单独打开 WinCal。
+系统面板已经打开时再启动 WinCal，也会自动接入当前面板。
+
+Windows 的系统面板层级高于普通置顶窗口。WinCal 临时从原生窗口的显示区域中
+裁去已确认的日历卡片，露出同位置的自定义日历，上方通知区域继续由 Windows 处理。
+收起面板或退出应用时恢复原显示区域；启动后会预热一个同名恢复守护进程，
+在 WinCal 主进程异常退出时尝试恢复原状。不会修改系统日历控件或保存系统设置。
+日历窗口也会提前在隐藏状态下完成创建和布局，后续打开复用窗口；
+正常收起后恢复守护继续待命，后续打开复用同一个进程和连接。
+首次打开时等待布局稳定并确认卡片边界，随后缓存位置。
+同一系统窗口、屏幕、缩放及原生区域形状未变化时，后续打开直接复用位置，
+不再等待 UI Automation 查询和布局稳定；显示后在后台检查布局变化。
+缓存仅保存在当前进程内，布局变化或保存设置后重新确认。
+打开和关闭动画中的临时区域变化不清除已验证的位置；显示前仍确认当前原生形状可恢复。
+当前依赖 Windows 11 的 `CalendarCenterGrid` / `NotificationCenterGrid` 标识；
+无法确认日历区域、日历已折叠、恢复守护未就绪或系统更新改变控件结构时，
+保留原生界面并使用托盘入口，禁止猜测坐标遮挡通知。
+若设置隐藏托盘图标，应用会先保留图标，直到本次启动后首次成功联动，保证始终有设置入口。
+
+### 设置与缓存
+
 设置文件位于 `%LOCALAPPDATA%\miniCal\settings.json`，ICS 缓存位于 `%LOCALAPPDATA%\WinCal\cache\`。
 
 设置界面支持：
@@ -128,6 +157,22 @@ publish.bat
 > 农历始终显示（暂无开关）。`settings.json` 中的 `ShowHeaderDateTime`、`TimeFormat` 已定义但尚未接入界面。
 
 ## 开发文档
+
+通知兼容的布局与窗口样式回归检查（无需 NuGet 测试框架）：
+
+```powershell
+dotnet run --project tests/NotificationCompatibility.Tests/NotificationCompatibility.Tests.csproj
+```
+
+在解锁的桌面上启动待测 WinCal，再执行实际遮挡与鼠标点击验收：
+
+```powershell
+dotnet run --project tests/LiveNotificationOverlayCheck/LiveNotificationOverlayCheck.csproj
+```
+
+验收检查日历与通知各五点的真实命中窗口、鼠标点击与滚轮翻月、通知标题点击、通知区域滚轮及关闭联动，
+并恢复原面板开关、通知滚动位置与鼠标位置。加 `--rapid-toggle` 可检查五组快速开关与恢复。
+这些桌面交互检查需在目标 Windows 版本上运行；程序不会读取通知内容或点击具体通知。
 
 - [产品与开发方案](WinCal_产品与开发方案.md)
 - [开发进度记录](PROGRESS.md)

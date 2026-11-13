@@ -1,4 +1,6 @@
 using System.Windows;
+using System.Windows.Interop;
+using WinCal.Core.Helpers;
 using WinCal.Core.Models;
 using WinCal.ViewModels;
 
@@ -9,6 +11,7 @@ public partial class EventDetailWindow : Window
     public EventDetailWindow()
     {
         InitializeComponent();
+        WindowActivationHelper.PreventActivation(this);
     }
 
     /// <summary>
@@ -68,22 +71,8 @@ public partial class EventDetailWindow : Window
     {
         if (!IsVisible || mainPanel == null) return;
 
-        // 主面板的位置和尺寸
-        double mainLeft = mainPanel.Left;
-        double mainTop = mainPanel.Top;
-        double mainHeight = mainPanel.ActualHeight;
-        double mainBottom = mainTop + mainHeight;
-
-        // 详情窗口定位到主面板左侧，间距 8px
-        Left = mainLeft - ActualWidth - 8;
-
-        // 底部对齐主面板底部
-        double targetTop = mainBottom - ActualHeight;
-
-        // 确保不超出屏幕上方
-        var screen = SystemParameters.WorkArea;
-        if (targetTop < screen.Top) targetTop = screen.Top;
-
-        Top = targetTop;
+        // 使用主面板所在显示器的工作区，并在左侧空间不足时尝试右侧。
+        WindowPositionHelper.PositionAlongsideSystemPanel(
+            this, new WindowInteropHelper(mainPanel).Handle);
     }
 }

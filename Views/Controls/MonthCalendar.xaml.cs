@@ -86,11 +86,12 @@ public partial class MonthCalendar : UserControl
             UpdateWeekHeaders(vm.WeekStartDay);
             vm.SelectDate(DateTime.Today);
             HookCollectionChanged(vm);
-            ScheduleSyncSelection(vm);
+            ScheduleSyncSelection();
         }
     }
 
     private CalendarViewModel? _hookedViewModel;
+    private bool _selectionSyncPending;
 
     /// <summary>
     /// 监听网格重建：月份切换 / 数据刷新会重建 CalendarDays，
@@ -111,19 +112,39 @@ public partial class MonthCalendar : UserControl
         System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
     {
         if (_hookedViewModel != null)
-            ScheduleSyncSelection(_hookedViewModel);
+            ScheduleSyncSelection();
     }
 
     /// <summary>
     /// 延到布局完成后再同步高亮：此刻 ItemsControl 才生成好新的 DayCell 容器
     /// </summary>
-    private void ScheduleSyncSelection(CalendarViewModel vm)
+    private void ScheduleSyncSelection()
     {
-        Dispatcher.BeginInvoke(new Action(() =>
+        // CalendarDays is rebuilt one item at a time. Coalesce all collection
+        // notifications from the same dispatcher turn into one visual-tree walk.
+        if (_selectionSyncPending) return;
+
+        _selectionSyncPending = true;
+        try
         {
-            SyncSelection(vm);
-            RefreshHoverUnderMouse();
-        }), System.Windows.Threading.DispatcherPriority.Loaded);
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                _selectionSyncPending = false;
+
+                // The queued callback may belong to a previous DataContext or
+                // collection rebuild; always use the current ViewModel.
+                if (!IsLoaded || DataContext is not CalendarViewModel currentVm)
+                    return;
+
+                SyncSelection(currentVm);
+                RefreshHoverUnderMouse();
+            }), System.Windows.Threading.DispatcherPriority.Loaded);
+        }
+        catch
+        {
+            _selectionSyncPending = false;
+            throw;
+        }
     }
 
     /// <summary>
@@ -165,7 +186,7 @@ public partial class MonthCalendar : UserControl
         {
             CalendarGrid.ItemsSource = vm.CalendarDays;
             HookCollectionChanged(vm);
-            ScheduleSyncSelection(vm);
+            ScheduleSyncSelection();
         }
     }
 
